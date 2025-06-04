@@ -368,14 +368,18 @@ class WanVace(WanT2V):
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
 
+        print(context[0].shape)
         # vace context encode
+        print(len(input_ref_images), len(input_ref_images[0]), input_ref_images[0][0].shape)
         z0 = self.vace_encode_frames(
             input_frames, input_ref_images, masks=input_masks)
         m0 = self.vace_encode_masks(input_masks, input_ref_images)
+        print(z0[0].shape, m0[0].shape)
         z = self.vace_latent(z0, m0)
 
         target_shape = list(z0[0].shape)
         target_shape[0] = int(target_shape[0] / 2)
+        print(target_shape)
         noise = [
             torch.randn(
                 target_shape[0],
@@ -389,6 +393,7 @@ class WanVace(WanT2V):
         seq_len = math.ceil((target_shape[2] * target_shape[3]) /
                             (self.patch_size[1] * self.patch_size[2]) *
                             target_shape[1] / self.sp_size) * self.sp_size
+        print(seq_len)
 
         @contextmanager
         def noop_no_sync():
@@ -407,6 +412,7 @@ class WanVace(WanT2V):
                 sample_scheduler.set_timesteps(
                     sampling_steps, device=self.device, shift=shift)
                 timesteps = sample_scheduler.timesteps
+                print(self.num_train_timesteps)
             elif sample_solver == 'dpm++':
                 sample_scheduler = FlowDPMSolverMultistepScheduler(
                     num_train_timesteps=self.num_train_timesteps,

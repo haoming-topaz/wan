@@ -224,6 +224,9 @@ class VACEInference:
             num_frames=num_frames,
             image_size=SIZE_CONFIGS[f"{output_width}*{output_height}"],
             device=self.pipe.device)
+
+        print(self.pipe.model)
+
         video = self.pipe.generate(
             prompt,
             src_video,
@@ -303,7 +306,7 @@ if __name__ == '__main__':
     parser.add_argument(
         "--model_name",
         type=str,
-        default="vace-14B",
+        default="vace-1.3B",
         choices=list(WAN_CONFIGS.keys()),
         help="The model name to run.")
     parser.add_argument(
@@ -320,7 +323,7 @@ if __name__ == '__main__':
         "--ckpt_dir",
         type=str,
         # default='models/VACE-Wan2.1-1.3B-Preview',
-        default='models/Wan2.1-VACE-14B/',
+        default='Wan2.1-VACE-1.3B/',
         help="The path to the checkpoint directory.",
     )
     parser.add_argument(
@@ -346,4 +349,6 @@ if __name__ == '__main__':
             root_path=args.root_path,
             allowed_paths=allowed_paths,
             show_error=True,
-            debug=True)
+            debug=True,
+            share=True
+        )
