@@ -12,8 +12,8 @@ def test_pipeline():
         config=config,
         checkpoint_dir='./Wan2.1-VACE-1.3B',
         pretrained_models_dir='./pretrained_models',
-        device_id=0,
-        rank=0,
+        target_size=(512, 512),
+        device_id=0,        
     )
 
     # points = [[(0, 0), (1, 1)]]
@@ -21,25 +21,18 @@ def test_pipeline():
     points = [[(1, 1)]]
     labels = [[1]]
     input_points = torch.tensor(points), torch.tensor(labels)
-    
-    video = pipe.generate(
+    input_image, input_points = pipe.prepare_input(
         input_image=Image.open('./sample_inputs/cars.jpg'),
         input_points=input_points,
     )
-
+    print(input_image.shape, input_points[0].shape, input_points[1].shape)
+    
+    output_mask = pipe(input_image, input_points)
     output_dir = 'sample_output'
-    os.makedirs(output_dir, exist_ok=True)
-    video_frames = (
-        torch.clamp(video / 2 + 0.5, min=0.0, max=1.0)
-        .permute(1, 2, 3, 0) * 255
-    ).cpu().numpy().astype(np.uint8)
+    output_path = os.path.join(output_dir, 'mask.png')
+    output_mask.save(output_path)
 
-    for idx, frame in enumerate(video_frames):
-        img = Image.fromarray(frame)
-        filename = os.path.join(output_dir, f"frame_{idx+1:05d}.png")
-        img.save(filename)
-
-    print(f"Frames saved to {output_dir}")
+    print(f"Frames saved to {output_path}")
 
 
 def gen_text_embeddings():

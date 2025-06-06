@@ -294,7 +294,7 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
@@ -302,7 +302,7 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
             freqs)
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function

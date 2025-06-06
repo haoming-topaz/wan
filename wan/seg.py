@@ -45,34 +45,45 @@ def prepare_text_input(config, checkpoint_dir, text, save_path):
         shard_fn=None,
     )
     text_encoder.model.eval().requires_grad_(False).to('cuda')
-    context = text_encoder([text], torch.device('cuda'))
-    print(context)
-    print(context[0].shape)
+    context = text_encoder([text], torch.device('cuda'))        
     torch.save(context, save_path)
     return
 
 
-class WanSeg(WanVace):
+def prepare_inputs(        
+    input_image,
+    input_points,
+    target_size,
+):
+    input_area = input_image.size[0] * input_image.size[1]
+    rescale_ratio = (target_size[0] * target_size[1] / input_area) ** 0.5
+    rescaled_w = int(input_image.size[0] * rescale_ratio) // 16 * 16
+    rescaled_h = int(input_image.size[1] * rescale_ratio) // 16 * 16
+    input_image = input_image.convert('RGB').resize((rescaled_w, rescaled_h))
+    input_image = TF.to_tensor(input_image).sub_(0.5).div_(0.5).unsqueeze(1)
+    input_points = input_points[0], input_points[1]
+    return input_image, input_points
+
+
+class WanSeg(nn.Module):
     def __init__(
         self,
         config,
         checkpoint_dir,
         pretrained_models_dir,
-        device_id=None,
-        rank=None,
+        target_size,
+        device_id=None,        
     ):
-        if device_id is not None:
-            self.device = torch.device(f"cuda:{device_id}")
-            self.rank = rank
+        super().__init__()
+        if device_id is None:
+            self.device = torch.device('cuda')
         else:
-            self.device = torch.device('cpu')
-            self.rank = 0
+            self.device = torch.device(f"cuda:{device_id}")
         
         self.config = config
-        self.num_train_timesteps = config.num_train_timesteps
-        self.param_dtype = config.param_dtype
+        self.num_train_timesteps = config.num_train_timesteps        
 
-        self.location_encoder = LocationEncoder(embed_dim=1024, output_dim=4096)
+        self.location_encoder = LocationEncoder(embed_dim=256, output_dim=1536)
         self.location_encoder.to(self.device)
  
         self.vae_stride = config.vae_stride
@@ -81,99 +92,94 @@ class WanSeg(WanVace):
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device
         )
-
-        logging.info(f"Creating WanSegModel from {checkpoint_dir}")
-        self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+        self.vae_project = nn.Conv2d(3, 1, kernel_size=1, stride=1, padding=0, device=self.device)
+                     
+        self.model = VaceWanModel.from_pretrained(checkpoint_dir)        
         self.model.vace_patch_embedding = nn.Conv3d(
-            16,
+            16, # was 96
             self.model.dim,
             kernel_size=self.model.patch_size,
             stride=self.model.patch_size
         )
         self.model.eval().requires_grad_(False)
 
-        self.context = [torch.load(os.path.join(pretrained_models_dir, 'segment_prompt.pt'))]
-        self.context_null = [torch.load(os.path.join(pretrained_models_dir, 'segment_negative_prompt.pt'))]
+        self.context = torch.load(os.path.join(pretrained_models_dir, 'segment_prompt.pt'))
+        self.context = nn.ParameterList([nn.Parameter(x.to(self.device)) for x in self.context])
+        self.context_null = torch.load(os.path.join(pretrained_models_dir, 'segment_negative_prompt.pt'))
+        self.context_null = nn.ParameterList([nn.Parameter(x.to(self.device)) for x in self.context_null])
 
         self.sp_size = 1
         self.model.to(self.device)
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def prepare_inputs(
+        self.target_size = target_size
+
+    def prepare_input(
         self,
         input_image,
-        input_points=None,
-        target_size=(768, 768),
+        input_points,        
     ):
-        input_area = input_image.size[0] * input_image.size[1]
-        rescale_ratio = (target_size[0] * target_size[1] / input_area) ** 0.5
-        rescaled_w = int(input_image.size[0] * rescale_ratio) // 16 * 16
-        rescaled_h = int(input_image.size[1] * rescale_ratio) // 16 * 16
-        input_image = input_image.convert('RGB').resize((rescaled_w, rescaled_h))
-        input_image = TF.to_tensor(input_image).sub_(0.5).div_(0.5).unsqueeze(1).to(self.device)
-        input_points = input_points[0].to(self.device), input_points[1].to(self.device)
+        input_image, input_points = prepare_inputs(
+            input_image,
+            input_points,
+            target_size=self.target_size,
+        )
+        input_image = input_image.to(self.device)
+        input_points = input_points[0].to(self.device), input_points[1].to(self.device)        
+
         return input_image, input_points
 
-    def generate(
+
+    def forward(
         self,
         input_image,
         input_points=None,
-        size=(1280, 720),
         shift=5.0,
-        sample_solver='unipc',
-        sampling_steps=25,
-        guide_scale=5.0,
+        sampling_steps=20,
         context_scale=1.0,
+        # sample_solver='unipc',        
+        # guide_scale=5.0,
         # prompt="",
         # negative_prompt="",
-        max_area=720 * 1280,
         seed=-1,
+        output_format='pil',
     ):
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
+        seed_g.manual_seed(seed)        
 
-        input_image, input_points = self.prepare_inputs(
-            input_image,
-            input_points,
-        )
-
-        context = self.location_encoder(
+        p0 = self.location_encoder(
             input_points,
             boxes=None,
             masks=None,
         )[0]
-        print(context.shape)
 
         m0 = self.vae.encode([input_image])
-        print(m0[0].shape)
 
         target_shape = list(m0[0].shape)
-        noise = [torch.randn(*target_shape, dtype=torch.float32, device=self.device, generator=seed_g)]
-
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                            (self.patch_size[1] * self.patch_size[2]) *
-                            target_shape[1] / self.sp_size) * self.sp_size
+        noise = [torch.randn(*target_shape, dtype=p0.dtype, device=self.device, generator=seed_g)]
+        seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
+                             (self.patch_size[1] * self.patch_size[2])
+                             * target_shape[1]) / self.sp_size) * self.sp_size
 
         @contextmanager
         def noop_no_sync():
             yield
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
-
-        print(seq_len)
-        with torch.amp.autocast(device_type='cuda', dtype=self.param_dtype), torch.no_grad(), no_sync():
+        
+        with torch.amp.autocast(device_type='cuda', dtype=p0.dtype), torch.no_grad(), no_sync():
             sample_scheduler = FlowUniPCMultistepScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=1,
+                solver_order=3,
                 use_dynamic_shifting=False
             )
-            print(self.num_train_timesteps)
             sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
             timesteps = sample_scheduler.timesteps
 
             latents = noise
-            arg_c = {'context': context, 'seq_len': seq_len}
+            arg_c = {'context': self.context, 'seq_len': seq_len}
             
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -183,9 +189,10 @@ class WanSeg(WanVace):
                 noise_pred = self.model(
                     latent_model_input,
                     t=timestep,
-                    vace_context=m0,
+                    vace_context=[p0, m0[0]],
                     vace_context_scale=context_scale,
-                    **arg_c)[0]
+                    **arg_c
+                )[0]
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -197,8 +204,11 @@ class WanSeg(WanVace):
                 latents = [temp_x0.squeeze(0)]
 
             x0 = latents
+                        
+        videos = self.vae.decode(x0)        
+        output_image = self.vae_project(videos[0][:, 0])          
+        output_image = torch.where(output_image > 0, 255, 0)
+        if output_format == 'pil':
+            output_image = Image.fromarray(output_image[0].detach().cpu().numpy().astype(np.uint8))
         
-        if self.rank == 0:
-            videos = self.vae.decode(x0)
-        
-        return videos[0]
+        return output_image

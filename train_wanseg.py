@@ -6,17 +6,25 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
+import torchvision
+import diffusers
+import math
+import datetime
+import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-import torchvision
-import diffusers
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.optimization import get_scheduler
+from diffusers import (
+    FlowMatchEulerDiscreteScheduler,
+    DDPMScheduler,
+)
 from wan.dataset import WanSegDataset
 from wan.seg import WanSeg
+from wan.text2video import FlowUniPCMultistepScheduler
 from wan.configs import WAN_CONFIGS
 from pathlib import Path
 from accelerate.utils import set_seed, ProjectConfiguration
@@ -41,30 +49,25 @@ def parse_str_list(arg):
 
 def parse_args(input_args=None):
     """
-    Parses command-line arguments used for configuring an paired session (pix2pix-Turbo).
+    Parses command-line arguments used for configuring the training session.
     This function sets up an argument parser to handle various training options.
 
     Returns:
     argparse.Namespace: The parsed command-line arguments.
-   """
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--revision", type=str, default=None,)
-    parser.add_argument("--variant", type=str, default=None,)
-    parser.add_argument("--tokenizer_name", type=str, default=None)
+    """
+    parser = argparse.ArgumentParser()    
 
     # training details
-    parser.add_argument("--output_dir", default='experience/osediff')
-    parser.add_argument("--seed", type=int, default=123, help="A seed for reproducible training.")
-    parser.add_argument("--resolution", type=int, default=512,)
-    parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
-    parser.add_argument("--num_training_epochs", type=int, default=10000)
-    parser.add_argument("--max_train_steps", type=int, default=100000,)
+    parser.add_argument("--output_dir", default='exp')
+    parser.add_argument("--seed", type=int, default=41, help="A seed for reproducible training.")    
+    parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
+    parser.add_argument("--num_training_epochs", type=int, default=5)
+    parser.add_argument("--max_train_steps", type=int, default=50000,)
     parser.add_argument("--global_step", type=int, default=0,)
-    parser.add_argument("--checkpointing_steps", type=int, default=500,)
+    parser.add_argument("--checkpointing_steps", type=int, default=2500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of updates steps to accumulate before performing a backward/update pass.",)
-    parser.add_argument("--gradient_checkpointing", action="store_true",)    
-    parser.add_argument("--vace_learning_rate", type=float, default=5e-5, help="Learning rate for VACE layers")
+    parser.add_argument("--gradient_checkpointing", action="store_true",)
+    parser.add_argument("--vace_learning_rate", type=float, default=1e-5, help="Learning rate for VACE layers")
     parser.add_argument("--prompt_learning_rate", type=float, default=5e-5, help="Learning rate for prompt encoder")
     parser.add_argument("--decoder_learning_rate", type=float, default=1e-5, help="Learning rate for decoder")
     parser.add_argument("--lr_scheduler", type=str, default="cosine",
@@ -77,67 +80,24 @@ def parse_args(input_args=None):
     parser.add_argument("--lr_num_cycles", type=int, default=1,
         help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
     )
-    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
-
-    parser.add_argument("--dataloader_num_workers", type=int, default=0,)
+    parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")    
+    parser.add_argument("--num_train_timesteps", type=int, default=1000, help="Number of timesteps for the noise scheduler.")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--allow_tf32", action="store_true",
-        help=(
-            "Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information, see"
-            " https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices"
-        ),
-    )
-    parser.add_argument("--report_to", type=str, default="tensorboard",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
-            ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
-        ),
-    )
-    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"],)
-    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers.")
+    parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"],)    
     parser.add_argument("--set_grads_to_none", action="store_true",)
-    parser.add_argument("--logging_dir", type=str, default="logs")
     
-    
-    parser.add_argument("--tracker_project_name", type=str, default="train_osediff", help="The name of the wandb project to log to.")
-    parser.add_argument('--dataset_txt_paths_list', type=parse_str_list, default=['YOUR TXT FILE PATH'], help='A comma-separated list of integers')
-    parser.add_argument('--dataset_prob_paths_list', type=parse_int_list, default=[1], help='A comma-separated list of integers')
-    parser.add_argument("--deg_file_path", default="params_realesrgan.yml", type=str)
-    parser.add_argument("--pretrained_model_name_or_path", default=None, type=str)
-    parser.add_argument("--merged_unet_vae", default=None, type=str)
-    parser.add_argument("--d_init_path", default=None, type=str)
-    parser.add_argument('--d_safetensor', type=str, default=None, help='Path to RAM model')
-    parser.add_argument('--g_safetensor', type=str, default=None, help='Path to RAM model')
+    parser.add_argument("--report_to", type=str, default="wandb")
+    parser.add_argument("--dataloader_num_workers", type=int, default=16,)
+    parser.add_argument("--logging_dir", type=str, default="logs")    
+    parser.add_argument("--tracker_project_name", type=str, default="train_wanseg", help="The name of the wandb project to log to.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="The wandb entity/username to log to.")    
 
-    parser.add_argument("--lambda_l2", default=1.0, type=float)
-    parser.add_argument("--lambda_latent", default=1.0, type=float)
-    parser.add_argument("--lambda_motion", default=0.0, type=float)
-    parser.add_argument("--lambda_lpips", default=2.0, type=float)
-    parser.add_argument("--lambda_g", default=1.0, type=float)
-    parser.add_argument("--lambda_vsd_lora", default=1.0, type=float)
-    parser.add_argument("--neg_prompt", default="", type=str)
-    parser.add_argument("--cfg_vsd", default=7.5, type=float)
-    # parser.add_argument("--spatial_size", default=32, type=int)
-    
-    parser.add_argument("--use_generic_prompt", action="store_true",)
-    parser.add_argument("--use_null_prompt", action="store_true",)
-    parser.add_argument("--image_condition_unet", default=None, type=str)
-    parser.add_argument("--deblur", action="store_true",)
-    parser.add_argument("--learn_residue", action="store_true",)
-    parser.add_argument("--gan_type", type=str, default="vanilla", choices=["vanilla", "wgan_softplus", "wgan", "hinge", "lsgan"],)
-    parser.add_argument("--no_degradation", action="store_true",)
-    # lora setting
-    parser.add_argument("--lora_rank", default=4, type=int)
-    parser.add_argument("--d_lora_rank", default=4, type=int)
-    parser.add_argument("--num_frames", default=21, type=int)
-    # ram path
-    parser.add_argument('--ram_path', type=str, default=None, help='Path to RAM model')
-    parser.add_argument("--dust", action="store_true",)
-
+    parser.add_argument("--target_size", type=tuple, default=(512, 512))
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -145,7 +105,6 @@ def parse_args(input_args=None):
         args = parser.parse_args()
 
     return args
-
 
 def gray_resize_for_identity(out, size=128):
     out_gray = (0.2989 * out[:, 0, :, :] + 0.5870 * out[:, 1, :, :] + 0.1140 * out[:, 2, :, :])
@@ -184,11 +143,37 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
-    config = WAN_CONFIGS['t2v-1.3B']
+    def print_gpu_memory(prefix=""):
+        if accelerator.is_main_process:
+            print(f"\n{prefix} GPU Memory Usage:")
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+            print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+            print(f"Max Cached: {torch.cuda.max_memory_reserved() / 1024**2:.2f} MB")
+
+    arch_config = WAN_CONFIGS['t2v-1.3B']
     pipe = WanSeg(
-        config=config,
+        config=arch_config,
         checkpoint_dir='./Wan2.1-VACE-1.3B',
+        pretrained_models_dir='./pretrained_models',
+        target_size=args.target_size,
     )
+
+    # Cast model to accelerator's dtype
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    else:
+        weight_dtype = torch.float32  # default
+
+    pipe = pipe.to(dtype=weight_dtype)
+    pipe.model = pipe.model.to(dtype=weight_dtype)
+    pipe.location_encoder = pipe.location_encoder.to(dtype=weight_dtype)
+    pipe.vae = pipe.vae.to(dtype=weight_dtype)
+    pipe.vae_project = pipe.vae_project.to(dtype=weight_dtype)
+    pipe.context = pipe.context.to(dtype=weight_dtype)
+    pipe.context_null = pipe.context_null.to(dtype=weight_dtype)
 
     # pipe.vae.enable_xformers_memory_efficient_attention()
     if args.allow_tf32:
@@ -209,10 +194,10 @@ def main(args):
         prompt_encoder_params.append(param)
         cnt_prompt_encoder += param.numel()
     
-    for name, param in pipe.vae.model.decoder.named_parameters():
+    for name, param in list(pipe.vae.model.decoder.named_parameters()) + list(pipe.vae_project.named_parameters()):
         param.requires_grad_(True)
         decoder_params.append(param)
-        cnt_decoder += param.numel()
+        cnt_decoder += param.numel()    
     
     if accelerator.is_main_process:
         print('Trainable parameters:')
@@ -246,181 +231,160 @@ def main(args):
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
 
 
-    dataset_train = WanSegDataset({
+    dataset = WanSegDataset(sources={
         'coco': './data/coco.jsonl',
-    })
+    }, auto_init=True, target_size=args.target_size)
+
+    total_size = len(dataset)
+    valid_size = 10
+    train_size = total_size - valid_size        
+
+    train_dataset, valid_dataset = torch.utils.data.random_split(
+        dataset, [train_size, valid_size],
+        generator=torch.Generator().manual_seed(args.seed)
+    )
+
+    # Create dataloaders for each split
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.dataloader_num_workers,
+    )
+
+    valid_dataloader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=False,
+        num_workers=args.dataloader_num_workers,
+    )
+
+    cnt_trainable, cnt_non_trainable = 0, 0
+    for param in pipe.parameters():
+        if param.requires_grad: 
+            cnt_trainable += param.numel()
+        else:
+            cnt_non_trainable += param.numel()
+    if accelerator.is_main_process:
+        print(f"Trainable parameters: {cnt_trainable / 1e6}M")
+        print(f"Non-trainable parameters: {cnt_non_trainable / 1e6}M")
     
     # Prepare everything with our `accelerator`.
-    model_gen, model_reg, optimizer_vace, optimizer_prompt, optimizer_decoder, optimizer_reg, dl_train, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder, lr_scheduler_reg = accelerator.prepare(
-        model_gen, model_reg, optimizer_vace, optimizer_prompt, optimizer_decoder, optimizer_reg, dl_train, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder, lr_scheduler_reg
+    pipe, optimizer_vace, optimizer_prompt, optimizer_decoder, train_dataloader, valid_dataloader, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder = accelerator.prepare(
+        pipe, optimizer_vace, optimizer_prompt, optimizer_decoder, train_dataloader, valid_dataloader, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder
     )
-    net_lpips = accelerator.prepare(net_lpips)
-    # renorm with image net statistics
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # Initialize wandb
     if accelerator.is_main_process:
-        args.dataset_txt_paths_list = str(args.dataset_txt_paths_list)
-        args.dataset_prob_paths_list = str(args.dataset_prob_paths_list)
-        tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
+        runname = datetime.datetime.now().strftime("%y-%m-%d-%H-%M")
+
+        if args.wandb_entity is not None:
+            wandb.init(
+                project=args.tracker_project_name,
+                entity=args.wandb_entity,     
+                name=runname,           
+                config=vars(args),
+            )
+        else:
+            wandb.init(
+                project=args.tracker_project_name,
+                name=runname,
+                config=vars(args)
+            )
 
     global_step = args.global_step
     progress_bar = tqdm(range(global_step, args.max_train_steps), initial=global_step, desc="Steps",
-        disable=not accelerator.is_local_main_process,)
-
-    # start the training loop
-    
-    for epoch in range(0, args.num_training_epochs):
-        for step, batch in enumerate(dl_train):
-
-            m_acc = [model_gen, model_reg]
-            with accelerator.accumulate(*m_acc):
-                x_src = batch["conditioning_pixel_values"]
-                x_tgt = batch["output_pixel_values"]  # b, f, c, h, w 
-                if args.dust:
-                    mask = batch["mask"]
-
-                # get text prompts from GT
-                if args.use_generic_prompt:
-                    batch_size = 1
-                    batch["prompt"] = ["high quality, high re solution, details, sharp, photorealistic"] * batch_size
-                else:
-                    x_tgt_ram = ram_transforms(x_tgt*0.5+0.5)
-                    caption = inference(x_tgt_ram.to(dtype=torch.float16), model_vlm)
-                    batch["prompt"] = [f'{each_caption}' for each_caption in caption]
-                        
-                x_src = x_src.unsqueeze(1)
-                x_tgt = x_tgt.unsqueeze(1)
-                
-                # if batch["lq"].shape[1] != args.num_frames or batch["gt"].shape[1] != args.num_frames:
-                #     lq_shape= batch["lq"].shape
-                #     gt_shape= batch["gt"].shape
-                #     print(f"Input data shape mismatch: {lq_shape} != {gt_shape}")
-
-                #     padT = args.num_frames - lq_shape[1]
-                #     padding = (0, 0, 0, 0, 0, int(padT))
-                #     batch["lq"] = torch.nn.functional.pad(batch["lq"].permute(0, 2, 1, 3, 4), padding, mode="replicate").permute(0, 2, 1, 3, 4)
-                #     batch["gt"] = torch.nn.functional.pad(batch["gt"].permute(0, 2, 1, 3, 4), padding, mode="replicate").permute(0, 2, 1, 3, 4)
-                #     print(f"Padding data shape: {batch['lq'].shape} == {batch['gt'].shape}")
-
-                #     # lq_dtype = batch["lq"].dtype
-                #     # batch["lq"], batch["gt"] = 0, 0
-                #     # batch["lq"] = torch.zeros([1, args.num_frames, 3, 480, 832]).to(accelerator.device).to(dtype=lq_dtype)
-                #     # batch["gt"] = torch.zeros([1, args.num_frames, 3, 480, 832]).to(accelerator.device).to(dtype=lq_dtype)
-
-                # x_src = batch["lq"] * 2 - 1 
-                # x_tgt = batch["gt"] * 2 - 1
-
-#                 # # degradation check before training            
-#                 # x_tgt = x_tgt * 0.5 + 0.5
-#                 # x_src = x_src * 0.5 + 0.5
-#                 # x_tgt = x_tgt.clamp(0, 1)[0].permute(0, 2, 3, 1).detach().cpu().numpy()
-#                 # x_src = x_src.clamp(0, 1)[0].permute(0, 2, 3, 1).detach().cpu().numpy()
-#                 # export_to_video([l for l in x_tgt], f"preset/datasets/data_check/gt_{global_step}_{accelerator.device}.mp4", fps=16)
-#                 # export_to_video([l for l in x_src], f"preset/datasets/data_check/lq_{global_step}_{accelerator.device}.mp4", fps=16)
+        disable=not accelerator.is_local_main_process)
         
-#                 # global_step += 1
-#                 # continue
+    for epoch in range(0, args.num_training_epochs):
+        for step, batch in enumerate(train_dataloader):            
+            with accelerator.autocast(), accelerator.accumulate(pipe, optimizer_vace, optimizer_prompt, optimizer_decoder):
+                image, gt_mask, points = batch
+                # Move data to accelerator device
+                image = image.to(accelerator.device)
+                gt_mask = gt_mask.to(accelerator.device)[0]                
 
-                x_src = x_src.permute(0, 2, 1, 3, 4) # b, f, c, h, w --> b, c, f, h, w  # need to change
-                x_tgt = x_tgt.permute(0, 2, 1, 3, 4)
+                points, labels = torch.stack(points[0]).unsqueeze(0).to(accelerator.device), points[1].unsqueeze(0).to(accelerator.device)
+                points = points.transpose(-1, -2)
 
-#                 # print(x_src.shape, x_tgt.shape)
-
-#                 # x_src = model_gen.module.random_sample(batch_size=1, num_frames=21)
-#                 # x_tgt = model_gen.module.random_sample(batch_size=1, num_frames=21).to(accelerator.device)
-#                 # combined = torch.concat([x_src, x_tgt], 2)
-#                 # torchvision.utils.save_image(0.5*combined + 0.5, f'tb_{np.random.randint(0, 99999)}.png')
-#                 # B, C, H, W = x_src.shape
-                
+                # prepare x0
+                mask_input = (gt_mask - 0.5) * 2
+                mask_input = mask_input.unsqueeze(0).expand(3, -1, -1, -1)
+                x0 = pipe.module.vae.encode([mask_input])[0].detach()
 
                 # forward pass
-                x_tgt_pred, latents_pred, prompt_embeds, latents_tgt = model_gen(x_src, x_tgt, batch=batch, args=args)
-                if args.lambda_latent > 0:
-                    loss_latent = F.mse_loss(latents_pred.float(), latents_tgt.float(), reduction="mean") * args.lambda_latent
+                # Access model components through the module attribute when using DDP
+                p0 = pipe.module.location_encoder(
+                    points=(points, labels),
+                    boxes=None,
+                    masks=None,
+                )[0]
+                m0 = pipe.module.vae.encode([image[0]])[0].detach()
+
+                target_shape = list(m0.shape)
+                noise = torch.randn(
+                    *target_shape,
+                    dtype=weight_dtype,
+                    device=accelerator.device
+                )
+                seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
+                                    (pipe.module.patch_size[1] * pipe.module.patch_size[2])
+                                    * target_shape[1]) / pipe.module.sp_size) * pipe.module.sp_size
+                
+                flow_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=args.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False,
+                    solver_order=1,
+                )
+                flow_scheduler.set_timesteps(args.num_train_timesteps)
+                timestep = torch.randint(0, args.num_train_timesteps, (1,), device=accelerator.device)
+                
+                noisy_latents = flow_scheduler.add_noise(
+                    x0,
+                    noise,
+                    timestep,
+                )
+
+                noise_pred = pipe.module.model(
+                    [noisy_latents],
+                    t=timestep,
+                    vace_context=[p0, m0],
+                    vace_context_scale=1.0,
+                    context=pipe.module.context,
+                    seq_len=seq_len
+                )
+                
+                noise_pred = noise_pred
+                noisy_latents = noisy_latents.unsqueeze(0)  # Add batch dimension
+                latent_pred = flow_scheduler.step(
+                    noise_pred,
+                    timestep,
+                    noisy_latents,
+                    return_dict=False,
+                )[0]
+                latent_pred = latent_pred[0]
+                latent_loss = F.mse_loss(latent_pred, x0, reduction="mean")
+                
+                decoded_latent = pipe.module.vae.decode([latent_pred])[0]
+                mask_pred = pipe.module.vae_project(decoded_latent[:, 0])
+                if mask_pred.shape != gt_mask.shape:
+                    recovered_mask_pred = F.interpolate(mask_pred.unsqueeze(0), size=gt_mask.shape[-2:], mode='bilinear', align_corners=False)[0]
                 else:
-                    loss_latent = torch.zeros(1).to(x_src.device)
+                    recovered_mask_pred = mask_pred
+                decoder_loss = F.binary_cross_entropy_with_logits(recovered_mask_pred, gt_mask)                
 
-                if args.lambda_motion > 0:
-                    x_tgt_pred_motion = x_tgt_pred.permute(0, 2, 1, 3, 4)
-                    x_tgt_pred_motion = x_tgt_pred_motion.view(-1, 3, x_tgt_pred_motion.size(3), x_tgt_pred_motion.size(4))
-                    
-                    x_tgt_motion = x_tgt.permute(0, 2, 1, 3, 4)
-                    x_tgt_motion = x_tgt_motion.view(-1, 3, x_tgt_motion.size(3), x_tgt_motion.size(4))
-                    
-                    idModel = ResNetArcFace('IRBlock',
-                                            [2,2,2,2],
-                                            False).to(x_src.device)
-                    idModel.load_state_dict(fix_state_dict(torch.load('/home/topaz/Yunan/Yunan/GFPGAN-1024/model/pretrained_models/arcface_resnet18.pth')))
-                    for p in idModel.parameters():
-                        p.requires_grad = False
-                    idModel.eval()
-                    
-                    out_gray = gray_resize_for_identity(x_tgt_pred_motion)
-                    tgt_gray = gray_resize_for_identity(x_tgt_motion)
-                    with torch.no_grad():
-                        identity_gt = idModel(tgt_gray)
-                        identity_out =   idModel(out_gray)
-                    loss_motion = F.l1_loss(identity_out.float(), identity_gt.float(), reduction="mean") * args.lambda_motion
-                    # loss_motion = (1 - F.cosine_similarity(identity_out, identity_gt, dim=1).mean()) * args.lambda_motion
-                else:
-                    loss_motion = torch.zeros(1).to(x_src.device)
-                # Reconstruction loss
-                if x_tgt_pred is not None:
-                    # print(x_tgt_pred.shape, 'pred b=========')
-                    x_tgt_pred = x_tgt_pred.permute(0, 2, 1, 3, 4)               
-                    x_tgt_pred = x_tgt_pred.view(-1, 3, x_tgt_pred.size(3), x_tgt_pred.size(4))
-                    
-                    # print(x_tgt_pred.shape, 'pred a=========')
+                loss = latent_loss + decoder_loss
+                loss = loss.to(dtype=weight_dtype)
 
-                    # dx, dy = model_gen.module.dx, model_gen.module.dy
-                    # spatial_size = 32 if args.num_frames==25 else 16
-                    # print(x_tgt.shape, 'tgt b=========')
-                    # x_tgt = x_tgt[:, :, :, 
-                    #     model_gen.module.x_start * 8 : 8 * (model_gen.module.x_start + model_gen.module.spatial_size), 
-                    #     model_gen.module.y_start * 8 : 8 * (model_gen.module.y_start + model_gen.module.spatial_size)
-                    #     ]
-                    x_tgt = x_tgt.permute(0, 2, 1, 3, 4)
-                    x_tgt = x_tgt.view(-1, 3, x_tgt.size(3), x_tgt.size(4))
-                    
-                    if args.dust:
-                        mask = mask.expand_as(x_tgt_pred)  # (B, C, H, W)
-                        mask_sum = mask.sum() + 1e-8  # Add epsilon to avoid division by zero
-                        loss_masked = F.mse_loss(x_tgt_pred * mask, x_tgt * mask, reduction='sum') / mask_sum
-                        inv_mask = 1 - mask
-                        inv_mask_sum = inv_mask.sum() + 1e-8
-                        loss_non_masked = F.mse_loss(x_tgt_pred * inv_mask, x_tgt * inv_mask, reduction='sum') / inv_mask_sum
-                        loss_l2 = (0.90 * loss_masked + 0.10 * loss_non_masked) * args.lambda_l2
-                        # print('mask_num: ', mask_sum, 'loss_masked: ', 0.80 *loss_masked, 'inv_mask_num: ', inv_mask_sum, 'loss_non_masked: ', 0.20*loss_non_masked, '--------------------------------')
-                        # print(torch.max(mask), torch.min(mask))
-                        # print('--------------------------------')
-                        # import pdb; pdb.set_trace()
-                    else:
-                        loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-                else: 
-                    loss_l2 = torch.zeros(1).to(x_src.device)
-                    loss_lpips = torch.zeros(1).to(x_src.device)
-
-                loss = loss_latent + loss_l2 + loss_lpips + loss_motion
-                if args.lambda_g > 0:
-                    # KL loss
-                    if torch.cuda.device_count() > 1:
-                        loss_g, g_fake_pred = model_reg.module.g_loss(latents=latents_pred, prompt_embeds=prompt_embeds, neg_prompt_embeds=None, args=args)
-                    else:
-                        loss_g, g_fake_pred = model_reg.g_loss(latents=latents_pred, prompt_embeds=prompt_embeds, neg_prompt_embeds=None, args=args)
-                    loss = loss + loss_g
+                # backward pass
                 accelerator.backward(loss)
+
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(vace_params, args.max_grad_norm)
                     accelerator.clip_grad_norm_(prompt_encoder_params, args.max_grad_norm)
                     accelerator.clip_grad_norm_(decoder_params, args.max_grad_norm)
+                
                 optimizer_vace.step()
                 optimizer_prompt.step()
                 optimizer_decoder.step()
@@ -431,62 +395,71 @@ def main(args):
                 optimizer_prompt.zero_grad(set_to_none=args.set_grads_to_none)
                 optimizer_decoder.zero_grad(set_to_none=args.set_grads_to_none)
 
-            
-                if args.lambda_g > 0:
-                    """
-                    d loss: let lora model closed to generator 
-                    """
-                    if torch.cuda.device_count() > 1:
-                        loss_d, loss_d_real, loss_d_fake, d_real_pred, d_fake_pred = model_reg.module.d_loss(latents=latents_pred, gt_latent=latents_tgt, prompt_embeds=prompt_embeds, args=args)
-                    else:
-                        loss_d, loss_d_real, loss_d_fake, d_real_pred, d_fake_pred = model_reg.d_loss(latents=latents_pred, gt_latent=latents_tgt, prompt_embeds=prompt_embeds, args=args)
-                    accelerator.backward(loss_d)
-                    if accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(layers_to_opt_reg, args.max_grad_norm)
-                    optimizer_reg.step()
-                    lr_scheduler_reg.step()
-                    optimizer_reg.zero_grad(set_to_none=args.set_grads_to_none)
-
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
 
                 if accelerator.is_main_process:
-                    
-                    logs = {}
-                    logs["epoch"] = epoch
-                    # log all the losses
-                    if args.lambda_g > 0:
-                        logs["loss_d"] = loss_d.detach().item()
-                        logs["loss_real"] = loss_d_real.detach().item()
-                        logs["loss_fake"] = loss_d_fake.detach().item()
-                        logs["d_real_pred"] = d_real_pred.detach().item()
-                        logs["d_fake_pred"] = d_fake_pred.detach().item()
-                        logs["loss_g"] = loss_g.detach().item()
-                        logs["g_fake_pred"] = g_fake_pred.detach().item()
-                    if args.dust:
-                        logs["loss_masked"] = loss_masked.detach().item()
-                        logs["loss_non_masked"] = loss_non_masked.detach().item()
-                    logs["loss_l2"] = loss_l2.detach().item()
-                    logs["loss_latent"] = loss_latent.detach().item()
-                    logs["loss_motion"] = loss_motion.detach().item()
-                    logs["loss_lpips"] = loss_lpips.detach().item()
-                    logs["loss"] = loss.detach().item()
-                    logs["lr_vace"] = lr_scheduler_vace.get_last_lr()[0]
-                    logs["lr_prompt"] = lr_scheduler_prompt.get_last_lr()[0]
-                    logs["lr_decoder"] = lr_scheduler_decoder.get_last_lr()[0]
+                    logs = {
+                        "latent_loss": latent_loss.detach().item(),
+                        "decoder_loss": decoder_loss.detach().item(),
+                        "total_loss": loss.detach().item(),
+                        "lr_vace": lr_scheduler_vace.get_last_lr()[0],
+                        "lr_prompt": lr_scheduler_prompt.get_last_lr()[0],
+                        "lr_decoder": lr_scheduler_decoder.get_last_lr()[0],
+                    }
                     progress_bar.set_postfix(**logs)
 
-                    # checkpoint the model
-                    if global_step % args.checkpointing_steps == 1:
-                        outf = os.path.join(args.output_dir, "checkpoints", f"model_g_{global_step}")
-                        accelerator.unwrap_model(model_gen).unet.save_pretrained(outf)
+                    # Log to wandb
+                    if args.report_to == "wandb":
+                        wandb.log(logs, step=global_step)
 
-                        outf = os.path.join(args.output_dir, "checkpoints", f"model_d_{global_step}.pth")
-                        torch.save(accelerator.unwrap_model(model_reg).unet_update.state_dict(), outf)
-                        # accelerator.unwrap_model(model_reg).unet_update.save(outf)
-                    accelerator.log(logs, step=global_step)
+                    # checkpoint the model
+                    if global_step % args.checkpointing_steps == 0:
+                        os.makedirs(os.path.join(args.output_dir, runname,"checkpoints"), exist_ok=True)
+                        outf = os.path.join(args.output_dir, runname, "checkpoints", f"model_{global_step}.pth")
+                        torch.save(accelerator.unwrap_model(pipe).state_dict(), outf)
+                        
+                        # Run validation
+                        if accelerator.is_main_process:
+                            print("\nRunning validation...")
+                            eval_pipe = accelerator.unwrap_model(pipe)
+                            eval_pipe.eval()
+
+                            val_out_dir = os.path.join(args.output_dir, runname, "eval", f"step_{global_step}")
+                            os.makedirs(val_out_dir, exist_ok=True)
+
+                            with torch.no_grad():
+                                for val_idx, val_batch in enumerate(valid_dataloader):
+                                    val_image, val_gt_mask, val_points = val_batch
+                                    val_image = val_image.to(accelerator.device)[0]
+                                    val_points, val_labels = torch.stack(val_points[0]).unsqueeze(0).to(accelerator.device), val_points[1].unsqueeze(0).to(accelerator.device)
+                                    val_points = val_points.transpose(-1, -2)
+                                    
+                                    # Generate mask
+                                    val_mask = eval_pipe(
+                                        input_image=val_image,
+                                        input_points=(val_points, val_labels),
+                                        output_format='pil',
+                                    )
+                                                                                                            
+                                    # Save input image                                    
+                                    input_img = val_image[:, 0].cpu().numpy()
+                                    input_img = ((input_img + 1) * 127.5).clip(0, 255).astype(np.uint8).transpose(1, 2, 0)                                    
+                                    Image.fromarray(input_img).save(os.path.join(val_out_dir, f"input_{val_idx}.png"))
+                                    
+                                    # Save ground truth mask
+                                    gt_mask = val_gt_mask[0][0].cpu().numpy()
+                                    gt_mask = (gt_mask * 255).clip(0, 255).astype(np.uint8)                                    
+                                    Image.fromarray(gt_mask).save(os.path.join(val_out_dir, f"gt_mask_{val_idx}.png"))
+                                    
+                                    # Save predicted mask
+                                    val_mask.save(os.path.join(val_out_dir, f"pred_mask_{val_idx}.png"))                                                                    
+                            
+                            eval_pipe.train()
+                            print("Validation complete!")
+
 
 if __name__ == "__main__":
     args = parse_args()

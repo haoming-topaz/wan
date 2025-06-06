@@ -616,13 +616,14 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
     return model
 
 
-class WanVAE:
+class WanVAE(nn.Module):
 
     def __init__(self,
                  z_dim=16,
                  vae_pth='cache/vae_step_411000.pth',
                  dtype=torch.float,
                  device="cuda"):
+        super().__init__()
         self.dtype = dtype
         self.device = device
 
@@ -634,9 +635,10 @@ class WanVAE:
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.mean = torch.tensor(mean, dtype=dtype, device=device)
+        self.mean = nn.Parameter(torch.tensor(mean, dtype=dtype, device=device))
         self.std = torch.tensor(std, dtype=dtype, device=device)
-        self.scale = [self.mean, 1.0 / self.std]
+        self.inv_std = nn.Parameter(1.0 / self.std)
+        self.scale = nn.ParameterList([self.mean, self.inv_std])
 
         # init model
         self.model = _video_vae(

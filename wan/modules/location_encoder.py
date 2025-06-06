@@ -14,10 +14,10 @@ import numpy as np
 class LocationEncoder(nn.Module):
     def __init__(
         self,
-        embed_dim: int = 1024,
-        output_dim: int = 4096,
-        image_embedding_size: Tuple[int, int] = (64, 64),
-        input_image_size: Tuple[int, int] = (512, 512),
+        embed_dim: int = 256,
+        output_dim: int = 1536,
+        image_embedding_size: Tuple[int, int] = (128, 128),
+        input_image_size: Tuple[int, int] = (1024, 1024),
         mask_in_chans: int = 16,
         activation: Type[nn.Module] = nn.GELU,
     ) -> None:
@@ -64,9 +64,9 @@ class LocationEncoder(nn.Module):
         self.no_mask_embed = nn.Embedding(1, embed_dim)
 
         self.adapter = nn.Sequential(
-            nn.Linear(embed_dim, output_dim),
-            nn.ReLU(),
-            nn.Linear(output_dim, output_dim)
+            nn.Conv1d(embed_dim, output_dim, kernel_size=1, groups=1),
+            activation(),
+            nn.Conv1d(output_dim, output_dim, kernel_size=1, groups=4),
         )
 
     def get_dense_pe(self) -> torch.Tensor:
@@ -202,9 +202,10 @@ class LocationEncoder(nn.Module):
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
-
+        
+        sparse_embeddings = sparse_embeddings.transpose(1, 2)
         sparse_embeddings = self.adapter(sparse_embeddings)
-
+        sparse_embeddings = sparse_embeddings.transpose(1, 2)
         return sparse_embeddings, dense_embeddings
     
 

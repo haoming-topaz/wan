@@ -40,4 +40,7 @@ data/
 sample_inputs/
 sample_output/
 pretrained_models/
+exp/
+wandb/
 *.txt
+nohup.out

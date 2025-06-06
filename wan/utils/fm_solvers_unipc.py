@@ -720,7 +720,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         self.this_order = min(this_order,
                               self.lower_order_nums + 1)  # warmup for multistep
-        assert self.this_order > 0
+        
+        if self.this_order <= 0:
+            print(f"this_order is {self.this_order}, solver_order is {self.config.solver_order}, lower_order_nums is {self.lower_order_nums}, timesteps is {self.timesteps}, step_index is {self.step_index}")
+            assert self.this_order > 0
 
         self.last_sample = sample
         prev_sample = self.multistep_uni_p_bh_update(
