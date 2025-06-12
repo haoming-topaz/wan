@@ -160,7 +160,7 @@ def convert():
             
             for ann in annotations:
                 count_total += 1
-                if ann['area'] < 100:
+                if ann['area'] < 16 * 16:
                     continue
                 instance_id = ann['id']
                 category_id = ann['category_id']

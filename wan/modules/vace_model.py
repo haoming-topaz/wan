@@ -134,21 +134,28 @@ class VaceWanModel(WanModel):
             stride=self.patch_size
         )
 
+    def squeeze_ffn(self, ratio=4):
+        new_ffn_dim = self.ffn_dim // ratio
+        for block in self.vace_blocks:
+            block.ffn_dim = new_ffn_dim
+            block.ffn = nn.Sequential(
+                nn.Linear(self.dim, new_ffn_dim), nn.GELU(approximate='tanh'),
+                nn.Linear(new_ffn_dim, self.dim))
+        self.ffn_dim = new_ffn_dim
+
     def forward_vace(self, x, vace_context, seq_len, kwargs):
         # embeddings
         c = []        
         for u in vace_context:
             if u.ndim == 4:
                 u = self.vace_patch_embedding(u.unsqueeze(0))
-                u = u.flatten(2).transpose(1, 2)                
+                u = u.flatten(2).transpose(1, 2)
+                u = torch.cat([u, u.new_zeros(1, seq_len - 2 - u.size(1), u.size(2))], dim=1)
                 c.append(u)
-            else:                
-                c.append(u)        
-                            
-        c = torch.cat([
-            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
-                      dim=1) for u in c
-        ])        
+            else:
+                c.append(u)
+        
+        c = torch.cat(c, dim=1)
 
         # arguments
         new_kwargs = dict(x=x)

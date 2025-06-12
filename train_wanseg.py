@@ -1,5 +1,6 @@
 import os
 import gc
+import random
 import argparse
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ import datetime
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from PIL import Image
+from PIL import Image, ImageDraw
 from torchvision import transforms
 from tqdm.auto import tqdm
 from diffusers.utils.import_utils import is_xformers_available
@@ -32,21 +33,6 @@ from accelerate import DistributedDataParallelKwargs
 from diffusers.utils import export_to_video
 
 
-def parse_float_list(arg):
-    try:
-        return [float(x) for x in arg.split(',')]
-    except ValueError:
-        raise argparse.ArgumentTypeError("List elements should be floats")
-
-def parse_int_list(arg):
-    try:
-        return [int(x) for x in arg.split(',')]
-    except ValueError:
-        raise argparse.ArgumentTypeError("List elements should be integers")
-
-def parse_str_list(arg):
-    return arg.split(',')
-
 def parse_args(input_args=None):
     """
     Parses command-line arguments used for configuring the training session.
@@ -55,21 +41,22 @@ def parse_args(input_args=None):
     Returns:
     argparse.Namespace: The parsed command-line arguments.
     """
-    parser = argparse.ArgumentParser()    
+    parser = argparse.ArgumentParser()
 
     # training details
-    parser.add_argument("--output_dir", default='exp')
+    parser.add_argument("--output_dir", default='exp-wan')
     parser.add_argument("--seed", type=int, default=41, help="A seed for reproducible training.")    
     parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--num_training_epochs", type=int, default=5)
-    parser.add_argument("--max_train_steps", type=int, default=50000,)
+    parser.add_argument("--max_train_steps", type=int, default=50005,)
     parser.add_argument("--global_step", type=int, default=0,)
     parser.add_argument("--checkpointing_steps", type=int, default=2500,)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+        help="Path to a specific checkpoint to resume training from. If None, training will start from scratch.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)
     parser.add_argument("--vace_learning_rate", type=float, default=1e-5, help="Learning rate for VACE layers")
-    parser.add_argument("--prompt_learning_rate", type=float, default=5e-5, help="Learning rate for prompt encoder")
-    parser.add_argument("--decoder_learning_rate", type=float, default=1e-5, help="Learning rate for decoder")
+    parser.add_argument("--prompt_learning_rate", type=float, default=2e-5, help="Learning rate for prompt encoder")
     parser.add_argument("--lr_scheduler", type=str, default="cosine",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
@@ -91,13 +78,22 @@ def parse_args(input_args=None):
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"],)    
     parser.add_argument("--set_grads_to_none", action="store_true",)
     
+    parser.add_argument("--anchor_warmup_steps", type=int, default=1000)
+    parser.add_argument("--anchor_loss_lambda", type=float, default=0.5)
+    parser.add_argument("--curriculum_warmup_steps", type=int, default=5000)
+    parser.add_argument("--flow_velocity_norm_lambda", type=float, default=0)
+    parser.add_argument("--multi_step_increase_steps", type=int, default=5000)
+    parser.add_argument("--multi_step_maximum", type=int, default=3)
+    parser.add_argument("--pure_noise_warmup_steps", type=int, default=10000)
+    parser.add_argument("--pure_noise_prob", type=float, default=0.0)
+
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--dataloader_num_workers", type=int, default=16,)
     parser.add_argument("--logging_dir", type=str, default="logs")    
     parser.add_argument("--tracker_project_name", type=str, default="train_wanseg", help="The name of the wandb project to log to.")
     parser.add_argument("--wandb_entity", type=str, default=None, help="The wandb entity/username to log to.")    
 
-    parser.add_argument("--target_size", type=tuple, default=(512, 512))
+    parser.add_argument("--target_size", type=int, nargs=2, default=(512, 512))
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -106,11 +102,6 @@ def parse_args(input_args=None):
 
     return args
 
-def gray_resize_for_identity(out, size=128):
-    out_gray = (0.2989 * out[:, 0, :, :] + 0.5870 * out[:, 1, :, :] + 0.1140 * out[:, 2, :, :])
-    out_gray = out_gray.unsqueeze(1)
-    out_gray = F.interpolate(out_gray, (size, size), mode='bilinear', align_corners=False)
-    return out_gray
 
 def fix_state_dict(state_dict):
     return {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -140,17 +131,8 @@ def main(args):
         set_seed(args.seed)
 
     if accelerator.is_main_process:
-        os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
-        os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
-
-    def print_gpu_memory(prefix=""):
-        if accelerator.is_main_process:
-            print(f"\n{prefix} GPU Memory Usage:")
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-            print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-            print(f"Max Cached: {torch.cuda.max_memory_reserved() / 1024**2:.2f} MB")
-
+        os.makedirs(os.path.join(args.output_dir), exist_ok=True)
+    
     arch_config = WAN_CONFIGS['t2v-1.3B']
     pipe = WanSeg(
         config=arch_config,
@@ -171,7 +153,6 @@ def main(args):
     pipe.model = pipe.model.to(dtype=weight_dtype)
     pipe.location_encoder = pipe.location_encoder.to(dtype=weight_dtype)
     pipe.vae = pipe.vae.to(dtype=weight_dtype)
-    pipe.vae_project = pipe.vae_project.to(dtype=weight_dtype)
     pipe.context = pipe.context.to(dtype=weight_dtype)
     pipe.context_null = pipe.context_null.to(dtype=weight_dtype)
 
@@ -180,8 +161,11 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
 
     # Train prompt encoder, vace layers, and vae decoder
-    vace_params, prompt_encoder_params, decoder_params = [], [], []
-    cnt_vace, cnt_prompt_encoder, cnt_decoder = 0, 0, 0
+    vace_params, prompt_encoder_params = [], []
+    cnt_vace, cnt_prompt_encoder = 0, 0
+
+    for param in pipe.parameters():
+        param.requires_grad_(False)
 
     for name, param in pipe.model.named_parameters():
         if 'vace' in name:
@@ -194,25 +178,16 @@ def main(args):
         prompt_encoder_params.append(param)
         cnt_prompt_encoder += param.numel()
     
-    for name, param in list(pipe.vae.model.decoder.named_parameters()) + list(pipe.vae_project.named_parameters()):
-        param.requires_grad_(True)
-        decoder_params.append(param)
-        cnt_decoder += param.numel()    
-    
     if accelerator.is_main_process:
         print('Trainable parameters:')
         print(f'Vace layers: {cnt_vace / 1e6}M')
         print(f'Prompt encoder: {cnt_prompt_encoder / 1e6}M')
-        print(f'Decoder: {cnt_decoder / 1e6}M')
     
     # Create separate optimizers for each parameter group
     optimizer_vace = torch.optim.AdamW(vace_params, lr=args.vace_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,)
     optimizer_prompt = torch.optim.AdamW(prompt_encoder_params, lr=args.prompt_learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,)
-    optimizer_decoder = torch.optim.AdamW(decoder_params, lr=args.decoder_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,)
 
@@ -225,11 +200,6 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
         num_training_steps=args.max_train_steps * accelerator.num_processes,
         num_cycles=args.lr_num_cycles, power=args.lr_power,)
-    lr_scheduler_decoder = get_scheduler(args.lr_scheduler, optimizer=optimizer_decoder,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
-        num_cycles=args.lr_num_cycles, power=args.lr_power,)
-
 
     dataset = WanSegDataset(sources={
         'coco': './data/coco.jsonl',
@@ -259,19 +229,20 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    cnt_trainable, cnt_non_trainable = 0, 0
-    for param in pipe.parameters():
-        if param.requires_grad: 
-            cnt_trainable += param.numel()
-        else:
-            cnt_non_trainable += param.numel()
     if accelerator.is_main_process:
+        cnt_trainable, cnt_non_trainable = 0, 0
+        for name, param in pipe.named_parameters():
+            if param.requires_grad:
+                print(name)
+                cnt_trainable += param.numel()
+            else:
+                cnt_non_trainable += param.numel()
         print(f"Trainable parameters: {cnt_trainable / 1e6}M")
         print(f"Non-trainable parameters: {cnt_non_trainable / 1e6}M")
     
     # Prepare everything with our `accelerator`.
-    pipe, optimizer_vace, optimizer_prompt, optimizer_decoder, train_dataloader, valid_dataloader, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder = accelerator.prepare(
-        pipe, optimizer_vace, optimizer_prompt, optimizer_decoder, train_dataloader, valid_dataloader, lr_scheduler_vace, lr_scheduler_prompt, lr_scheduler_decoder
+    pipe, optimizer_vace, optimizer_prompt, train_dataloader, lr_scheduler_vace, lr_scheduler_prompt = accelerator.prepare(
+        pipe, optimizer_vace, optimizer_prompt, train_dataloader, lr_scheduler_vace, lr_scheduler_prompt
     )
 
     # Initialize wandb
@@ -282,7 +253,7 @@ def main(args):
             wandb.init(
                 project=args.tracker_project_name,
                 entity=args.wandb_entity,     
-                name=runname,           
+                name=runname,
                 config=vars(args),
             )
         else:
@@ -293,23 +264,50 @@ def main(args):
             )
 
     global_step = args.global_step
+
+    # Load checkpoint if specified
+    if args.resume_from_checkpoint is not None:
+        if accelerator.is_main_process:
+            print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
+        
+        # Load the checkpoint
+        checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
+        
+        # Load model state
+        pipe.load_state_dict(checkpoint["model_state_dict"])
+        
+        # Load optimizer states
+        optimizer_vace.load_state_dict(checkpoint["optimizer_vace_state_dict"])
+        optimizer_prompt.load_state_dict(checkpoint["optimizer_prompt_state_dict"])
+        
+        # Load scheduler states
+        lr_scheduler_vace.load_state_dict(checkpoint["lr_scheduler_vace_state_dict"])
+        lr_scheduler_prompt.load_state_dict(checkpoint["lr_scheduler_prompt_state_dict"])
+        
+        # Update global step
+        global_step = checkpoint["global_step"]
+        
+        if accelerator.is_main_process:
+            print(f"Resumed from step {global_step}")
+
     progress_bar = tqdm(range(global_step, args.max_train_steps), initial=global_step, desc="Steps",
         disable=not accelerator.is_local_main_process)
-        
-    for epoch in range(0, args.num_training_epochs):
-        for step, batch in enumerate(train_dataloader):            
-            with accelerator.autocast(), accelerator.accumulate(pipe, optimizer_vace, optimizer_prompt, optimizer_decoder):
-                image, gt_mask, points = batch
+    
+    pipe.train()
+    multi_step_count = 1
+    for _ in range(0, args.num_training_epochs):
+        for batch in train_dataloader:
+            with accelerator.autocast(), accelerator.accumulate(pipe, optimizer_vace, optimizer_prompt):
+                image, gt_mask, points, _ = batch
                 # Move data to accelerator device
                 image = image.to(accelerator.device)
-                gt_mask = gt_mask.to(accelerator.device)[0]                
+                gt_mask = gt_mask.to(accelerator.device)                
 
                 points, labels = torch.stack(points[0]).unsqueeze(0).to(accelerator.device), points[1].unsqueeze(0).to(accelerator.device)
                 points = points.transpose(-1, -2)
 
                 # prepare x0
-                mask_input = (gt_mask - 0.5) * 2
-                mask_input = mask_input.unsqueeze(0).expand(3, -1, -1, -1)
+                mask_input = gt_mask.expand(3, -1, -1, -1)
                 x0 = pipe.module.vae.encode([mask_input])[0].detach()
 
                 # forward pass
@@ -319,7 +317,15 @@ def main(args):
                     boxes=None,
                     masks=None,
                 )[0]
+
                 m0 = pipe.module.vae.encode([image[0]])[0].detach()
+
+                flow_scheduler = FlowMatchEulerDiscreteScheduler(
+                    num_train_timesteps=args.num_train_timesteps,
+                    shift=1,                    
+                    use_dynamic_shifting=False,
+                )
+                flow_scheduler.set_timesteps(args.num_train_timesteps)
 
                 target_shape = list(m0.shape)
                 noise = torch.randn(
@@ -330,135 +336,192 @@ def main(args):
                 seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
                                     (pipe.module.patch_size[1] * pipe.module.patch_size[2])
                                     * target_shape[1]) / pipe.module.sp_size) * pipe.module.sp_size
-                
-                flow_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=args.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False,
-                    solver_order=1,
-                )
-                flow_scheduler.set_timesteps(args.num_train_timesteps)
-                timestep = torch.randint(0, args.num_train_timesteps, (1,), device=accelerator.device)
-                
-                noisy_latents = flow_scheduler.add_noise(
-                    x0,
-                    noise,
-                    timestep,
-                )
+                seq_len += 2
 
-                noise_pred = pipe.module.model(
-                    [noisy_latents],
-                    t=timestep,
-                    vace_context=[p0, m0],
-                    vace_context_scale=1.0,
-                    context=pipe.module.context,
-                    seq_len=seq_len
-                )
+                curriculum_progress = min(1.0, global_step / args.curriculum_warmup_steps)
+                upper_bound = min(args.num_train_timesteps - 1, int(curriculum_progress * args.num_train_timesteps))
+                upper_bound = max(10, upper_bound)
                 
-                noise_pred = noise_pred
-                noisy_latents = noisy_latents.unsqueeze(0)  # Add batch dimension
-                latent_pred = flow_scheduler.step(
-                    noise_pred,
-                    timestep,
-                    noisy_latents,
-                    return_dict=False,
-                )[0]
-                latent_pred = latent_pred[0]
-                latent_loss = F.mse_loss(latent_pred, x0, reduction="mean")
+                step_idx = random.randint(0, upper_bound - multi_step_count)
+                timestep = torch.stack([flow_scheduler.timesteps[step_idx]]).to(accelerator.device)
                 
-                decoded_latent = pipe.module.vae.decode([latent_pred])[0]
-                mask_pred = pipe.module.vae_project(decoded_latent[:, 0])
-                if mask_pred.shape != gt_mask.shape:
-                    recovered_mask_pred = F.interpolate(mask_pred.unsqueeze(0), size=gt_mask.shape[-2:], mode='bilinear', align_corners=False)[0]
+                use_pure_noise = False
+                # if global_step > args.pure_noise_warmup_steps:
+                #     random_noise_prob = min(args.pure_noise_prob, args.pure_noise_prob * (global_step - args.pure_noise_warmup_steps) / args.pure_noise_warmup_steps)
+                #     if random.random() < random_noise_prob:
+                #         use_pure_noise = True
+
+                if use_pure_noise:
+                    noisy_latents = torch.randn_like(x0)
                 else:
-                    recovered_mask_pred = mask_pred
-                decoder_loss = F.binary_cross_entropy_with_logits(recovered_mask_pred, gt_mask)                
+                    sigmas = flow_scheduler.sigmas.to(accelerator.device)                    
+                    sigmas = sigmas[step_idx]
+                    noisy_latents = (1.0 - sigmas) * x0 + sigmas * noise
+                    # noisy_latents = flow_scheduler.add_noise(x0, noise, timestep)                
 
-                loss = latent_loss + decoder_loss
-                loss = loss.to(dtype=weight_dtype)
+                target = noise - x0
 
-                # backward pass
+                latent_losses = []
+                # anchor_losses = []
+                # velocity_losses = []
+
+                for K in range(multi_step_count):
+                    noise_pred = pipe.module.model(
+                        [noisy_latents],
+                        t=timestep,
+                        vace_context=[p0, m0],
+                        vace_context_scale=1.0,
+                        context=pipe.module.context,
+                        seq_len=seq_len
+                    )[0]
+
+                    latent_losses.append(F.mse_loss(noise_pred, target, reduction='mean'))
+                    
+                    # current_latent = flow_scheduler.step(
+                    #     target,
+                    #     timestep,
+                    #     noisy_latents,
+                    # )[0]
+
+                    # if accelerator.is_main_process:
+                    #     print('x0', accelerator.device, x0[0][0])
+                    #     print('noise', accelerator.device, noise[0][0])
+                    #     print('noisy_latents', accelerator.device, noisy_latents[0][0])
+                    #     print('current_latent', accelerator.device, current_latent[0][0])
+                    #     assert False
+                    
+                    # anchor_losses.append(F.mse_loss(current_latent, x0, reduction='mean'))
+                    # velocity_losses.append(noise_pred.norm())
+
+                    # noisy_latents = current_latent
+                    if K + 1 < multi_step_count:
+                        timestep = flow_scheduler.timesteps[flow_scheduler.step_index]
+                
+                latent_loss = sum(latent_losses) / len(latent_losses)
+                # Anchor loss
+                # anchor_loss = sum(anchor_losses) / len(anchor_losses)
+                # lambda_anchor_loss = min(args.anchor_loss_lambda, global_step / args.anchor_warmup_steps)                                
+                # velocity_loss = sum(velocity_losses) / len(velocity_losses)
+                
+                loss = latent_loss # + \
+                    # lambda_anchor_loss * anchor_loss + \
+                    # args.flow_velocity_norm_lambda * velocity_loss
+                
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(vace_params, args.max_grad_norm)
                     accelerator.clip_grad_norm_(prompt_encoder_params, args.max_grad_norm)
-                    accelerator.clip_grad_norm_(decoder_params, args.max_grad_norm)
                 
                 optimizer_vace.step()
                 optimizer_prompt.step()
-                optimizer_decoder.step()
                 lr_scheduler_vace.step()
                 lr_scheduler_prompt.step()
-                lr_scheduler_decoder.step()
                 optimizer_vace.zero_grad(set_to_none=args.set_grads_to_none)
                 optimizer_prompt.zero_grad(set_to_none=args.set_grads_to_none)
-                optimizer_decoder.zero_grad(set_to_none=args.set_grads_to_none)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-
+                
                 if accelerator.is_main_process:
                     logs = {
-                        "latent_loss": latent_loss.detach().item(),
-                        "decoder_loss": decoder_loss.detach().item(),
-                        "total_loss": loss.detach().item(),
-                        "lr_vace": lr_scheduler_vace.get_last_lr()[0],
-                        "lr_prompt": lr_scheduler_prompt.get_last_lr()[0],
-                        "lr_decoder": lr_scheduler_decoder.get_last_lr()[0],
+                        "loss": loss.detach().item(),                        
+                        # "latent_loss": latent_loss.detach().item(),
+                        # '1-step latent loss': latent_losses[-1].detach().item(),
+                        # '2-step latent loss': 0 if len(latent_losses) < 2 else latent_losses[-2].detach().item(),
+                        # '3-step latent loss': 0 if len(latent_losses) < 3 else latent_losses[-3].detach().item(),
+                        # "anchor_loss": anchor_loss.detach().item(),
+                        # '1-step anchor loss': anchor_losses[-1].detach().item(),
+                        # '2-step anchor loss': 0 if len(anchor_losses) < 2 else anchor_losses[-2].detach().item(),
+                        # '3-step anchor loss': 0 if len(anchor_losses) < 3 else anchor_losses[-3].detach().item(),
+                        # "velocity_loss": velocity_loss.detach().item(),
+                        # "curriculum_progress": curriculum_progress,
+                        # "K": multi_step_count,
                     }
                     progress_bar.set_postfix(**logs)
+
+                    if global_step % args.multi_step_increase_steps == 0 and multi_step_count < args.multi_step_maximum:
+                        multi_step_count += 1
 
                     # Log to wandb
                     if args.report_to == "wandb":
                         wandb.log(logs, step=global_step)
 
                     # checkpoint the model
-                    if global_step % args.checkpointing_steps == 0:
-                        os.makedirs(os.path.join(args.output_dir, runname,"checkpoints"), exist_ok=True)
+                    if global_step % args.checkpointing_steps == 2 or global_step == args.max_train_steps:
+                        os.makedirs(os.path.join(args.output_dir, runname, "checkpoints"), exist_ok=True)
                         outf = os.path.join(args.output_dir, runname, "checkpoints", f"model_{global_step}.pth")
-                        torch.save(accelerator.unwrap_model(pipe).state_dict(), outf)
+                        if global_step >= 5000:
+                            # Save full checkpoint
+                            checkpoint = {
+                                "model_state_dict": accelerator.unwrap_model(pipe).state_dict(),
+                                "optimizer_vace_state_dict": optimizer_vace.state_dict(),
+                                "optimizer_prompt_state_dict": optimizer_prompt.state_dict(),
+                                "lr_scheduler_vace_state_dict": lr_scheduler_vace.state_dict(),
+                                "lr_scheduler_prompt_state_dict": lr_scheduler_prompt.state_dict(),
+                                "global_step": global_step,
+                            }
+                            torch.save(checkpoint, outf)
                         
                         # Run validation
-                        if accelerator.is_main_process:
-                            print("\nRunning validation...")
-                            eval_pipe = accelerator.unwrap_model(pipe)
-                            eval_pipe.eval()
+                        print("\nRunning validation...")
+                        eval_pipe = accelerator.unwrap_model(pipe)
+                        eval_pipe.eval()
 
-                            val_out_dir = os.path.join(args.output_dir, runname, "eval", f"step_{global_step}")
-                            os.makedirs(val_out_dir, exist_ok=True)
+                        val_out_dir = os.path.join(args.output_dir, runname, "eval", f"step_{global_step}")
+                        os.makedirs(val_out_dir, exist_ok=True)
 
-                            with torch.no_grad():
-                                for val_idx, val_batch in enumerate(valid_dataloader):
-                                    val_image, val_gt_mask, val_points = val_batch
-                                    val_image = val_image.to(accelerator.device)[0]
-                                    val_points, val_labels = torch.stack(val_points[0]).unsqueeze(0).to(accelerator.device), val_points[1].unsqueeze(0).to(accelerator.device)
-                                    val_points = val_points.transpose(-1, -2)
-                                    
-                                    # Generate mask
-                                    val_mask = eval_pipe(
-                                        input_image=val_image,
-                                        input_points=(val_points, val_labels),
-                                        output_format='pil',
-                                    )
-                                                                                                            
-                                    # Save input image                                    
-                                    input_img = val_image[:, 0].cpu().numpy()
-                                    input_img = ((input_img + 1) * 127.5).clip(0, 255).astype(np.uint8).transpose(1, 2, 0)                                    
-                                    Image.fromarray(input_img).save(os.path.join(val_out_dir, f"input_{val_idx}.png"))
-                                    
-                                    # Save ground truth mask
-                                    gt_mask = val_gt_mask[0][0].cpu().numpy()
-                                    gt_mask = (gt_mask * 255).clip(0, 255).astype(np.uint8)                                    
-                                    Image.fromarray(gt_mask).save(os.path.join(val_out_dir, f"gt_mask_{val_idx}.png"))
-                                    
-                                    # Save predicted mask
-                                    val_mask.save(os.path.join(val_out_dir, f"pred_mask_{val_idx}.png"))                                                                    
-                            
-                            eval_pipe.train()
-                            print("Validation complete!")
+                        with torch.no_grad():
+                            for val_idx, val_batch in enumerate(valid_dataloader):
+                                val_image, val_gt_mask, val_points, paths = val_batch
+                                val_image = val_image.to(accelerator.device)[0]
+                                val_points, val_labels = torch.stack(val_points[0]).unsqueeze(0).to(accelerator.device), val_points[1].unsqueeze(0).to(accelerator.device)
+                                val_points = val_points.transpose(-1, -2)
+                                
+                                # Generate mask
+                                val_mask = eval_pipe(
+                                    input_image=val_image,
+                                    input_points=(val_points, val_labels),
+                                    output_format='pil',                                    
+                                )
+
+                                mask_input = val_gt_mask.expand(3, -1, -1, -1).to(accelerator.device)
+                                x0 = eval_pipe.vae.encode([mask_input])[0].detach()
+                                pred_mask = eval_pipe.vae.model.decoder(x0.unsqueeze(0))[0]
+                                pred_mask = pred_mask[0][0]
+                                pred_mask = torch.where(
+                                    pred_mask > 0,
+                                    torch.ones_like(pred_mask, dtype=torch.uint8),
+                                    torch.zeros_like(pred_mask, dtype=torch.uint8),
+                                )
+                                pred_mask = pred_mask.cpu().numpy() * 255
+                                pred_mask = Image.fromarray(pred_mask.astype(np.uint8)).convert('RGB')
+                                draw = ImageDraw.Draw(pred_mask)
+                                
+                                refer_point = list(val_points[0][0].detach().cpu().numpy())
+                                x, y = refer_point
+                                draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill='red')
+                                pred_mask.save(os.path.join(val_out_dir, f"recovered_mask_{val_idx}.png"))
+
+                                # Save input
+                                Image.open(paths[0][0]).save(os.path.join(val_out_dir, f"input_{val_idx}.png"))
+                                Image.open(paths[1][0]).save(os.path.join(val_out_dir, f"gt_mask_{val_idx}.png"))
+                                # Save predicted mask
+                                val_mask.save(os.path.join(val_out_dir, f"pred_mask_{val_idx}.png"))                                                                    
+                        
+                        eval_pipe.train()
+                        print("Validation complete!")
+
+                if global_step >= args.max_train_steps:
+                    break
+            
+            if global_step >= args.max_train_steps:
+                break
+                
+        if global_step >= args.max_train_steps:
+            break
 
 
 if __name__ == "__main__":

@@ -2,8 +2,10 @@ import torch
 import numpy as np
 import os
 from PIL import Image
+from wan.text2video import WanT2V
 from wan.seg import WanSeg, prepare_text_input
 from wan.configs import WAN_CONFIGS
+import torchvision.transforms.functional as TF
 
 
 def test_pipeline():
@@ -54,6 +56,27 @@ def gen_text_embeddings():
     )
 
 
+def test_vae():
+    config = WAN_CONFIGS['t2v-1.3B']
+    pipe = WanT2V(
+        config=config,
+        checkpoint_dir='./Wan2.1-T2V-1.3B',
+        device_id=0,
+        rank=0,
+    )    
+    image = Image.open('/home/topaz/haoming/seg/exp/25-06-07-19-55/eval/step_2/gt_mask_2.png').convert('RGB')
+    image = TF.to_tensor(image).sub_(0.5).div_(0.5).to(torch.device('cuda:0')).unsqueeze(1).unsqueeze(0)
+    latents = pipe.vae.encode(image)
+    outputs = pipe.vae.decode(latents)
+    print(len(outputs))
+    output = (outputs[0][:, 0, :, :] + 1 * 0.5).clamp(0, 1)
+    output = output.permute(1, 2, 0).detach().cpu().numpy()
+    output = (output * 255).astype(np.uint8)
+    output = Image.fromarray(output)
+    output.save('sample_output/vae_output.png')
+
+
 if __name__ == '__main__':
     # gen_text_embeddings()
     test_pipeline()
+    # test_vae()

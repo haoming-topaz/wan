@@ -39,8 +39,10 @@ poetry.lock
 data/
 sample_inputs/
 sample_output/
+sample_outputs/
 pretrained_models/
 exp/
+exp-wan/
 wandb/
 *.txt
 nohup.out

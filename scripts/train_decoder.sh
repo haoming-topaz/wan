@@ -1,3 +1,3 @@
-accelerate launch train_wanseg.py \
+accelerate launch train_decoder.py \
    --set_grads_to_none \
    --allow_tf32

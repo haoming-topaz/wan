@@ -33,6 +33,8 @@ from .text2video import (
 )
 from .vace import WanVace
 from .modules.vace_model import VaceWanModel
+from .modules.maskdecoder import MaskDecoder3D
+from .modules.coord_encoder import CoordinateConditionEncoder
 
 
 def prepare_text_input(config, checkpoint_dir, text, save_path):
@@ -71,7 +73,7 @@ class WanSeg(nn.Module):
         config,
         checkpoint_dir,
         pretrained_models_dir,
-        target_size,
+        target_size,        
         device_id=None,        
     ):
         super().__init__()
@@ -83,8 +85,10 @@ class WanSeg(nn.Module):
         self.config = config
         self.num_train_timesteps = config.num_train_timesteps        
 
-        self.location_encoder = LocationEncoder(embed_dim=256, output_dim=1536)
-        self.location_encoder.to(self.device)
+        # self.location_encoder = LocationEncoder(embed_dim=256, output_dim=1536)
+        # self.location_encoder.to(self.device)
+        self.coord_encoder = CoordinateConditionEncoder()
+        self.coord_encoder.to(self.device)
  
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -92,21 +96,26 @@ class WanSeg(nn.Module):
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device
         )
-        self.vae_project = nn.Conv2d(3, 1, kernel_size=1, stride=1, padding=0, device=self.device)
-                     
-        self.model = VaceWanModel.from_pretrained(checkpoint_dir)        
+        del self.vae.model.decoder
+        self.vae.model.decoder = MaskDecoder3D(in_channels=16)
+        self.vae.model.decoder.load_state_dict(torch.load(os.path.join(pretrained_models_dir, 'maskdecoder.pth')))
+        self.vae.model.decoder.to(self.device)
+        
+        self.model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.model.vace_patch_embedding = nn.Conv3d(
-            16, # was 96
+            36, # was 96
             self.model.dim,
             kernel_size=self.model.patch_size,
             stride=self.model.patch_size
         )
+        self.model.squeeze_ffn(ratio=4)
+        # self.model = VaceWanModel()
         self.model.eval().requires_grad_(False)
 
         self.context = torch.load(os.path.join(pretrained_models_dir, 'segment_prompt.pt'))
-        self.context = nn.ParameterList([nn.Parameter(x.to(self.device)) for x in self.context])
+        self.context = nn.ParameterList([nn.Parameter(x.to(self.device), requires_grad=False) for x in self.context])
         self.context_null = torch.load(os.path.join(pretrained_models_dir, 'segment_negative_prompt.pt'))
-        self.context_null = nn.ParameterList([nn.Parameter(x.to(self.device)) for x in self.context_null])
+        self.context_null = nn.ParameterList([nn.Parameter(x.to(self.device), requires_grad=False) for x in self.context_null])
 
         self.sp_size = 1
         self.model.to(self.device)
@@ -135,7 +144,7 @@ class WanSeg(nn.Module):
         input_image,
         input_points=None,
         shift=5.0,
-        sampling_steps=20,
+        sampling_steps=50,
         context_scale=1.0,
         # sample_solver='unipc',        
         # guide_scale=5.0,
@@ -148,19 +157,21 @@ class WanSeg(nn.Module):
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)        
 
-        p0 = self.location_encoder(
-            input_points,
-            boxes=None,
-            masks=None,
-        )[0]
-
+        # p0 = self.location_encoder(
+        #     input_points,
+        #     boxes=None,
+        #     masks=None,
+        # )[0]
         m0 = self.vae.encode([input_image])
+        p0 = self.coord_encoder(input_points[0], input_points[1], m0.shape[-2], m0.shape[-1])
+        print(m0.shape, p0.shape)
 
         target_shape = list(m0[0].shape)
         noise = [torch.randn(*target_shape, dtype=p0.dtype, device=self.device, generator=seed_g)]
         seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
                              (self.patch_size[1] * self.patch_size[2])
                              * target_shape[1]) / self.sp_size) * self.sp_size
+        seq_len += 2
 
         @contextmanager
         def noop_no_sync():
@@ -185,7 +196,7 @@ class WanSeg(nn.Module):
                 latent_model_input = latents
                 timestep = [t]
                 timestep = torch.stack(timestep)
-                self.model.to(self.device)
+
                 noise_pred = self.model(
                     latent_model_input,
                     t=timestep,
@@ -204,9 +215,8 @@ class WanSeg(nn.Module):
                 latents = [temp_x0.squeeze(0)]
 
             x0 = latents
-                        
-        videos = self.vae.decode(x0)        
-        output_image = self.vae_project(videos[0][:, 0])          
+        
+        output_image = self.vae.model.decoder(x0[0].unsqueeze(0))[0][0]
         output_image = torch.where(output_image > 0, 255, 0)
         if output_format == 'pil':
             output_image = Image.fromarray(output_image[0].detach().cpu().numpy().astype(np.uint8))

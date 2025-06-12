@@ -635,9 +635,9 @@ class WanVAE(nn.Module):
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.mean = nn.Parameter(torch.tensor(mean, dtype=dtype, device=device))
+        self.mean = nn.Parameter(torch.tensor(mean, dtype=dtype, device=device), requires_grad=False)
         self.std = torch.tensor(std, dtype=dtype, device=device)
-        self.inv_std = nn.Parameter(1.0 / self.std)
+        self.inv_std = nn.Parameter(1.0 / self.std, requires_grad=False)
         self.scale = nn.ParameterList([self.mean, self.inv_std])
 
         # init model
@@ -650,14 +650,14 @@ class WanVAE(nn.Module):
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast(dtype=self.dtype):
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             return [
                 self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
                 for u in videos
             ]
 
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             return [
                 self.model.decode(u.unsqueeze(0),
                                   self.scale).float().clamp_(-1, 1).squeeze(0)
