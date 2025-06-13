@@ -150,12 +150,14 @@ class VaceWanModel(WanModel):
             if u.ndim == 4:
                 u = self.vace_patch_embedding(u.unsqueeze(0))
                 u = u.flatten(2).transpose(1, 2)
-                u = torch.cat([u, u.new_zeros(1, seq_len - 2 - u.size(1), u.size(2))], dim=1)
+                u = torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
                 c.append(u)
             else:
                 c.append(u)
+
+        # print(c[0].shape)
         
-        c = torch.cat(c, dim=1)
+        c = torch.cat(c, dim=0)
 
         # arguments
         new_kwargs = dict(x=x)

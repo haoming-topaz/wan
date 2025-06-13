@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 class CoordinateConditionEncoder(nn.Module):
     def __init__(self, num_channels=20, num_abs_freqs=4):
         """
@@ -19,18 +20,19 @@ class CoordinateConditionEncoder(nn.Module):
         # Conv1x1 projection layer to normalize and fuse channels
         self.proj = nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=True)
 
-    def forward(self, x, y, H, W):
+    def forward(self, coords, H, W):
         """
         x, y: target coordinate, float or tensor of shape (N,) if batching
         H, W: target image size
         Output: (C, H, W) tensor
         """
+        x, y = coords[:, 0], coords[:, 1]
         device = x.device
         
         # Prepare pixel grid (H, W)
         yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
         yy = yy.to(torch.float32)
-        xx = xx.to(torch.float32)        
+        xx = xx.to(torch.float32)
         
         # delta_x / delta_y with normalization to [-1, 1]
         delta_x_norm = 2.0 * (xx - x) / max(W - 1, 1)

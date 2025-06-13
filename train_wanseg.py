@@ -30,7 +30,11 @@ from wan.configs import WAN_CONFIGS
 from pathlib import Path
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate import DistributedDataParallelKwargs
-from diffusers.utils import export_to_video
+from diffusers.training_utils import (
+    EMAModel,
+    compute_loss_weighting_for_sd3,
+    compute_density_for_timestep_sampling
+)
 
 
 def parse_args(input_args=None):
@@ -103,8 +107,8 @@ def parse_args(input_args=None):
     return args
 
 
-def fix_state_dict(state_dict):
-    return {k.replace('module.', ''): v for k, v in state_dict.items()}
+def wrap_state_dict(state_dict):
+    return {'module.' + k: v for k, v in state_dict.items()}
 
 
 def main(args):
@@ -151,7 +155,7 @@ def main(args):
 
     pipe = pipe.to(dtype=weight_dtype)
     pipe.model = pipe.model.to(dtype=weight_dtype)
-    pipe.location_encoder = pipe.location_encoder.to(dtype=weight_dtype)
+    pipe.coord_encoder = pipe.coord_encoder.to(dtype=weight_dtype)
     pipe.vae = pipe.vae.to(dtype=weight_dtype)
     pipe.context = pipe.context.to(dtype=weight_dtype)
     pipe.context_null = pipe.context_null.to(dtype=weight_dtype)
@@ -173,7 +177,7 @@ def main(args):
             vace_params.append(param)
             cnt_vace += param.numel()
 
-    for name, param in pipe.location_encoder.named_parameters():
+    for name, param in pipe.coord_encoder.named_parameters():
         param.requires_grad_(True)
         prompt_encoder_params.append(param)
         cnt_prompt_encoder += param.numel()
@@ -274,7 +278,8 @@ def main(args):
         checkpoint = torch.load(args.resume_from_checkpoint, map_location="cpu")
         
         # Load model state
-        pipe.load_state_dict(checkpoint["model_state_dict"])
+        model_state_dict = wrap_state_dict(checkpoint["model_state_dict"])
+        pipe.load_state_dict(model_state_dict)
         
         # Load optimizer states
         optimizer_vace.load_state_dict(checkpoint["optimizer_vace_state_dict"])
@@ -304,7 +309,7 @@ def main(args):
                 gt_mask = gt_mask.to(accelerator.device)                
 
                 points, labels = torch.stack(points[0]).unsqueeze(0).to(accelerator.device), points[1].unsqueeze(0).to(accelerator.device)
-                points = points.transpose(-1, -2)
+                points = points.transpose(-1, -2)                
 
                 # prepare x0
                 mask_input = gt_mask.expand(3, -1, -1, -1)
@@ -312,13 +317,16 @@ def main(args):
 
                 # forward pass
                 # Access model components through the module attribute when using DDP
-                p0 = pipe.module.location_encoder(
-                    points=(points, labels),
-                    boxes=None,
-                    masks=None,
-                )[0]
+                # p0 = pipe.module.location_encoder(
+                #     points=(points, labels),
+                #     boxes=None,
+                #     masks=None,
+                # )[0]
 
                 m0 = pipe.module.vae.encode([image[0]])[0].detach()
+                p0 = pipe.module.coord_encoder(points[0], m0.shape[-2], m0.shape[-1])
+                p0 = p0.unsqueeze(1)
+                vace_context = torch.cat([p0, m0])                
 
                 flow_scheduler = FlowMatchEulerDiscreteScheduler(
                     num_train_timesteps=args.num_train_timesteps,
@@ -336,7 +344,7 @@ def main(args):
                 seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
                                     (pipe.module.patch_size[1] * pipe.module.patch_size[2])
                                     * target_shape[1]) / pipe.module.sp_size) * pipe.module.sp_size
-                seq_len += 2
+                # seq_len += 2
 
                 curriculum_progress = min(1.0, global_step / args.curriculum_warmup_steps)
                 upper_bound = min(args.num_train_timesteps - 1, int(curriculum_progress * args.num_train_timesteps))
@@ -369,7 +377,7 @@ def main(args):
                     noise_pred = pipe.module.model(
                         [noisy_latents],
                         t=timestep,
-                        vace_context=[p0, m0],
+                        vace_context=[vace_context],
                         vace_context_scale=1.0,
                         context=pipe.module.context,
                         seq_len=seq_len
@@ -488,7 +496,8 @@ def main(args):
                                 )
 
                                 mask_input = val_gt_mask.expand(3, -1, -1, -1).to(accelerator.device)
-                                x0 = eval_pipe.vae.encode([mask_input])[0].detach()
+                                x0 = eval_pipe.vae.encode([mask_input])[0].detach()                                
+                                
                                 pred_mask = eval_pipe.vae.model.decoder(x0.unsqueeze(0))[0]
                                 pred_mask = pred_mask[0][0]
                                 pred_mask = torch.where(

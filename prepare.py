@@ -20,17 +20,18 @@ def test_pipeline():
 
     # points = [[(0, 0), (1, 1)]]
     # labels = [[0, 1]]
-    points = [[(1, 1)]]
+    image_path = './sample_inputs/cars.jpg'
+    points = [[(5, 8)]]
     labels = [[1]]
     input_points = torch.tensor(points), torch.tensor(labels)
     input_image, input_points = pipe.prepare_input(
-        input_image=Image.open('./sample_inputs/cars.jpg'),
+        input_image=Image.open(image_path),
         input_points=input_points,
     )
-    print(input_image.shape, input_points[0].shape, input_points[1].shape)
+    print(Image.open(image_path).size, input_points[0].shape, input_points[1].shape)
     
     output_mask = pipe(input_image, input_points)
-    output_dir = 'sample_output'
+    output_dir = 'sample_outputs'
     output_path = os.path.join(output_dir, 'mask.png')
     output_mask.save(output_path)
 
@@ -73,7 +74,7 @@ def test_vae():
     output = output.permute(1, 2, 0).detach().cpu().numpy()
     output = (output * 255).astype(np.uint8)
     output = Image.fromarray(output)
-    output.save('sample_output/vae_output.png')
+    output.save('sample_outputs/vae_output.png')
 
 
 if __name__ == '__main__':

@@ -83,7 +83,8 @@ class WanVace(WanT2V):
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+            shard_fn=shard_fn if t5_fsdp else None
+        )
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size

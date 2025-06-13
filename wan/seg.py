@@ -108,7 +108,7 @@ class WanSeg(nn.Module):
             kernel_size=self.model.patch_size,
             stride=self.model.patch_size
         )
-        self.model.squeeze_ffn(ratio=4)
+        self.model.squeeze_ffn(ratio=2)
         # self.model = VaceWanModel()
         self.model.eval().requires_grad_(False)
 
@@ -162,16 +162,20 @@ class WanSeg(nn.Module):
         #     boxes=None,
         #     masks=None,
         # )[0]
-        m0 = self.vae.encode([input_image])
-        p0 = self.coord_encoder(input_points[0], input_points[1], m0.shape[-2], m0.shape[-1])
-        print(m0.shape, p0.shape)
+        m0 = self.vae.encode([input_image])        
+        coords, labels = input_points                
+        p0 = self.coord_encoder(coords[:, 0, :], m0[0].shape[-2], m0[0].shape[-1])
+        p0 = p0.unsqueeze(1)
+        print(coords[:, 0, :])
+
+        vace_context = torch.cat([p0, m0[0]])
 
         target_shape = list(m0[0].shape)
         noise = [torch.randn(*target_shape, dtype=p0.dtype, device=self.device, generator=seed_g)]
         seq_len = math.ceil(((target_shape[2] * target_shape[3]) / 
                              (self.patch_size[1] * self.patch_size[2])
                              * target_shape[1]) / self.sp_size) * self.sp_size
-        seq_len += 2
+        # seq_len += 2
 
         @contextmanager
         def noop_no_sync():
@@ -200,7 +204,7 @@ class WanSeg(nn.Module):
                 noise_pred = self.model(
                     latent_model_input,
                     t=timestep,
-                    vace_context=[p0, m0[0]],
+                    vace_context=[vace_context],
                     vace_context_scale=context_scale,
                     **arg_c
                 )[0]
